@@ -6,7 +6,7 @@
 
 import logging
 
-HOST_REPORT_TIME = 1.0
+HOST_REPORT_TIME = 0.1
 RPI_PROC_TEMP_FILE = "/sys/class/thermal/thermal_zone0/temp"
 
 class Temperature_HOST:
