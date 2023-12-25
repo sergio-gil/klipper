@@ -33,9 +33,9 @@ REG_PWR_MGMT_2 =    0x6C
 
 SAMPLE_RATE_DIVS = { 4000:0x00 }
 
-SET_CONFIG =        0x01 # FIFO mode 'stream' style
+SET_CONFIG =        0x00 # FIFO mode 'stream' style
 SET_ACCEL_CONFIG =  0x10 # 8g full scale
-SET_ACCEL_CONFIG2 = 0x08 # 1046Hz BW, 0.503ms delay 4kHz sample rate
+SET_ACCEL_CONFIG2 = 0x00 # 1046Hz BW, 0.503ms delay 4kHz sample rate
 SET_PWR_MGMT_1_WAKE =     0x00
 SET_PWR_MGMT_1_SLEEP=     0x40
 SET_PWR_MGMT_2_ACCEL_ON = 0x07
