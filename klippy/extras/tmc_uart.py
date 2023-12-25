@@ -75,7 +75,7 @@ def lookup_tmc_uart_mutex(mcu):
         pmutexes.mcu_to_mutex[mcu] = mutex
     return mutex
 
-TMC_BAUD_RATE = 115200
+TMC_BAUD_RATE = 500000
 TMC_BAUD_RATE_AVR = 9000
 
 # Code for sending messages on a TMC uart by bitbanging
@@ -192,175 +192,46 @@ class MCU_TMC_uart_bitbang:
 
 # Lookup a (possibly shared) tmc uart
 def lookup_tmc_uart(config, max_addr):
-    serial_port = config.get('serial_port', None)
-    device = config.get('device', None)
     addr = config.getint('uart_address', 0, minval=0, maxval=max_addr)
+    ppins = config.get_printer().lookup_object("pins")
+    uart_pin_params = ppins.lookup_pin(config.get('uart_pin'), can_pullup=True, share_type="tmc_uart")
 
-    if device is not None:
-        instance_id = 0
-        if MCU_TMC_uart_device.mcu_uart is None:
-            MCU_TMC_uart_device.mcu_uart = MCU_TMC_uart_device(config.get_printer(), device)
-        mcu_uart = MCU_TMC_uart_device.mcu_uart
-    elif serial_port is not None:
-        instance_id = 0
-        mcu_uart = MCU_TMC_uart_serial(config.get_printer(), serial_port)
-    else:
-        ppins = config.get_printer().lookup_object("pins")
-        rx_pin_params = ppins.lookup_pin(config.get('uart_pin'), can_pullup=True,
-                                        share_type="tmc_uart_rx")
-        tx_pin_desc = config.get('tx_pin', None)
-        if tx_pin_desc is None:
-            tx_pin_params = rx_pin_params
-        else:
-            tx_pin_params = ppins.lookup_pin(tx_pin_desc, share_type="tmc_uart_tx")
-        if rx_pin_params['chip'] is not tx_pin_params['chip']:
-            raise ppins.error("TMC uart rx and tx pins must be on the same mcu")
-        select_pins_desc = config.getlist('select_pins', None)
-        mcu_uart = rx_pin_params.get('class')
-        if mcu_uart is None:
-            mcu_uart = MCU_TMC_uart_bitbang(rx_pin_params, tx_pin_params,
-                                            select_pins_desc)
-            rx_pin_params['class'] = mcu_uart
-        instance_id = mcu_uart.register_instance(rx_pin_params, tx_pin_params,
-                                                select_pins_desc, addr)
+    instance_id = 0
+    mcu_uart = uart_pin_params.get('class')
+    if mcu_uart is None:
+        mcu_uart = MCU_TMC_uart_device(uart_pin_params)
+        uart_pin_params['class'] = mcu_uart
 
     return instance_id, addr, mcu_uart
 
-TMCUART_READ = 0
-TMCUART_WRITE = 1
+class MCU_TMC_uart_device:  
+    def __init__(self, uart_pin_params):
+        self.uart_pin = uart_pin_params['pin']
+        self.mcu = uart_pin_params['chip']
+        self.cmd_queue = self.mcu.alloc_command_queue()
+        self.mutex = lookup_tmc_uart_mutex(self.mcu)
+        self.mcu.register_config_callback(self.build_config)
 
-class MCU_TMC_uart_device:
-    mcu_uart = None
-    
-    def __init__(self, printer, device):
-        self.printer = printer
-        self.mutex = printer.get_reactor().mutex()
-        self.device = device
-        self.tmcuart = os.open(self.device, os.O_RDWR)
-
-    def __del__(self):
-        os.close(self.tmcuart)
+    def build_config(self):
+        self.mcu.add_config_cmd(
+            "config_tmcuart_device uart_pin=%s baud=%u"
+            % (self.uart_pin, TMC_BAUD_RATE))
+        self.tmcuart_send_cmd = self.mcu.lookup_query_command(
+            "tmcuart_device_send addr=%u reg=%u read=%c write=%u",
+            "tmcuart_device_response success=%c read=%u", cq=self.cmd_queue, is_async=True)
 
     def reg_read(self, instance_id, addr, reg):
-        data = [ TMCUART_READ, addr, reg ]
-
-        try:
-            os.write(self.tmcuart, bytes(data))
-            val = os.read(self.tmcuart, 32)
-        except Exception as e:
-            logging.warn("TMC uart: SERIAL READ ERROR: " + str(e))
+        params = self.tmcuart_send_cmd.send([addr, reg, 1, 0])
+        if params['success'] == 0:
             return None
-
-        time.sleep(0.001)
-
-        val = struct.unpack(">i", val[3:7])[0]
-        return val
+        return params['read']
 
     def reg_write(self, instance_id, addr, reg, val, print_time=None):
-        data = [ TMCUART_WRITE, addr, reg ]
-
-        data.append(0xFF & (val>>24))
-        data.append(0xFF & (val>>16))
-        data.append(0xFF & (val>>8))
-        data.append(0xFF & val)
-
-        try:
-            os.write(self.tmcuart, bytes(data))
-        except Exception as e:
-            logging.error("TMC uart: SERIAL WRITE ERROR: " + str(e))
+        minclock = 0
+        if print_time is not None:
+            minclock = self.mcu.print_time_to_clock(print_time)
+        self.tmcuart_send_cmd.send([addr, reg, 0, val], minclock=minclock)
         
-        time.sleep(0.001)
-
-class MCU_TMC_uart_serial:
-    r_frame  = [0x55, 0, 0, 0]
-    w_frame  = [0x55, 0, 0, 0, 0, 0, 0, 0]
-
-    def __init__(self, printer, serial_port):
-        self.mutex = printer.get_reactor().mutex()
-
-        try:
-            self.ser = serial.Serial(serial_port, TMC_BAUD_RATE)
-        except Exception as e:
-            raise "TMC uart: SERIAL ERROR: " + str(e)
-
-        self.ser.BYTESIZES = 1
-        self.ser.PARITIES = serial.PARITY_NONE
-        self.ser.STOPBITS = 1
-
-        self.ser.timeout = 20000 / TMC_BAUD_RATE
-        self.communication_pause = 500 / TMC_BAUD_RATE
-
-        self.ser.reset_output_buffer()
-        self.ser.reset_input_buffer()
-
-    def __del__(self):
-        if self.ser != None:
-            self.ser.close()
-
-    def compute_crc8_atm(self, datagram, initial_value=0):
-        crc = initial_value
-        # Iterate bytes in data
-        for byte in datagram:
-            # Iterate bits in byte
-            for _ in range(0, 8):
-                if (crc >> 7) ^ (byte & 0x01):
-                    crc = ((crc << 1) ^ 0x07) & 0xFF
-                else:
-                    crc = (crc << 1) & 0xFF
-                # Shift to next bit
-                byte = byte >> 1
-        return crc
-
-    def reg_read(self, instance_id, addr, reg):
-        self.ser.reset_output_buffer()
-        self.ser.reset_input_buffer()
-        
-        self.r_frame[1] = addr
-        self.r_frame[2] = reg
-        self.r_frame[3] = self.compute_crc8_atm(self.r_frame[:-1])
-
-        rtn = self.ser.write(self.r_frame)
-        if rtn != len(self.r_frame):
-            raise "TMC UART: Err in write"
-
-        time.sleep(self.communication_pause)  # adjust per baud and hardware. Sequential reads without some delay fail.
-        
-        rtn = self.ser.read(12)
-
-        time.sleep(self.communication_pause)
-        
-        rtn_data = rtn[7:11]
-
-        not_zero_count = len([elem for elem in rtn if elem != 0])
-            
-        if len(rtn)<12 or not_zero_count == 0:
-            raise  "TMC2209: UART Communication Error: "+str(len(rtn_data))+" data bytes | "+str(len(rtn))+" total bytes"
-        elif rtn[11] != self.compute_crc8_atm(rtn[4:11]):
-            raise "TMC2209: UART Communication Error: CRC MISMATCH"
-
-        val = struct.unpack(">i",rtn_data)[0]
-
-        return val
-
-    def reg_write(self, instance_id, addr, reg, val, print_time=None):
-        self.ser.reset_output_buffer()
-        self.ser.reset_input_buffer()
-        
-        self.w_frame[1] = addr
-        self.w_frame[2] = reg | 0x80;  # set write bit
-        
-        self.w_frame[3] = 0xFF & (val>>24)
-        self.w_frame[4] = 0xFF & (val>>16)
-        self.w_frame[5] = 0xFF & (val>>8)
-        self.w_frame[6] = 0xFF & val
-        
-        self.w_frame[7] = self.compute_crc8_atm(self.w_frame[:-1])
-
-        rtn = self.ser.write(self.w_frame)
-        if rtn != len(self.w_frame):
-            raise "TMC2209: Err in write"
-
-        time.sleep(self.communication_pause)
 
 # Helper code for communicating via TMC uart
 class MCU_TMC_uart:
@@ -394,7 +265,7 @@ class MCU_TMC_uart:
         if self.printer.get_start_args().get('debugoutput') is not None:
             return
         with self.mutex:
-            for retry in range(5):
+            for retry in range(10):
                 ifcnt = self.ifcnt
                 if ifcnt is None:
                     self.ifcnt = ifcnt = self._do_get_register("IFCNT")
@@ -403,6 +274,9 @@ class MCU_TMC_uart:
                 self.ifcnt = self._do_get_register("IFCNT")
                 if self.ifcnt == (ifcnt + 1) & 0xff:
                     return
+
+                self.ifcnt = None
+                logging.info("Wrong IFCNT %d Expected: %d", self.ifcnt, ifcnt + 1)
         raise self.printer.command_error(
             "Unable to write tmc uart '%s' register %s" % (self.name, reg_name))
     def get_tmc_frequency(self):
