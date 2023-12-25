@@ -14,6 +14,9 @@
 #include <sys/stat.h> // chmod
 #include <time.h> // struct timespec
 #include <unistd.h> // ttyname
+#include </usr/include/sched.h> // sched_setscheduler sched_get_priority_max
+#include <pthread.h>
+#include <semaphore.h>
 #include "board/irq.h" // irq_wait
 #include "board/misc.h" // console_sendf
 #include "command.h" // command_find_block
@@ -22,6 +25,9 @@
 
 static struct pollfd main_pfd[1];
 #define MP_TTY_IDX   0
+
+pthread_t console_thread;
+sem_t console_semaphore; 
 
 // Report 'errno' in a message written to stderr
 void
@@ -62,6 +68,8 @@ set_close_on_exec(int fd)
     }
     return 0;
 }
+
+void* console_loop(void* data);
 
 int
 console_setup(char *name)
@@ -108,6 +116,29 @@ console_setup(char *name)
     ret = set_non_blocking(STDERR_FILENO);
     if (ret)
         return -1;
+
+    sem_init(&console_semaphore, 0, 0);
+
+    pthread_attr_t attr;
+    ret = pthread_attr_init(&attr);
+    if (ret)
+        return -1;
+
+    ret = pthread_attr_setschedpolicy(&attr, SCHED_FIFO);
+    if (ret)
+        return -1;
+
+    struct sched_param param;
+    param.sched_priority = 95;
+    ret = pthread_attr_setschedparam(&attr, &param);
+    if (ret)
+        return -1;
+
+    ret = pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED);
+    if (ret)
+        return -1;
+
+    ret = pthread_create(&console_thread, &attr, &console_loop, NULL);
 
     return 0;
 }
@@ -161,6 +192,8 @@ console_task(void)
         }
     }
     receive_pos = len;
+
+    sem_post(&console_semaphore);
 }
 DECL_TASK(console_task);
 
@@ -178,16 +211,20 @@ console_sendf(const struct command_encoder *ce, va_list args)
         report_errno("write", ret);
 }
 
-// Sleep until a signal received (waking early for console input if needed)
-void
-console_sleep(sigset_t *sigset)
+void* console_loop(void* data)
 {
-    int ret = ppoll(main_pfd, ARRAY_SIZE(main_pfd), NULL, sigset);
-    if (ret <= 0) {
-        if (errno != EINTR)
-            report_errno("ppoll main_pfd", ret);
-        return;
+    for (;;)
+    {
+        int ret = ppoll(main_pfd, ARRAY_SIZE(main_pfd), NULL, NULL);
+        if (ret < 0) {
+            if (errno != EINTR)
+                report_errno("ppoll main_pfd", ret);
+            shutdown("Console Error");
+        }
+        if (main_pfd[MP_TTY_IDX].revents)
+        {
+            sched_wake_task(&console_wake);
+            sem_wait(&console_semaphore);
+        }
     }
-    if (main_pfd[MP_TTY_IDX].revents)
-        sched_wake_task(&console_wake);
 }
